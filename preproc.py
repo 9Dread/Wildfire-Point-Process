@@ -1,146 +1,171 @@
-import pandas as pd
+#Python script for preprocessing data.
+#This includes combining the covariates I crawled (in Data/MarcosCovs) with the covariates crawled
+#by Michelle (Data/MichellesCovs). It also includes adjusting my covariates for one-timestep-ahead
+#prediction.
+
+#The processed datasets are ALREADY in Data/CombinedCovs, so these scripts do not need to be rerun.
+
+#Problem:
+#  We want to make our dataset fit for one-timestep-ahead prediction. This is because, although the
+#  variables have dates attached to them, they are not available for same-day prediction in real time.
+#  Specifically, fm100 and fm1000 are from gridMET (https://www.climatologylab.org/gridmet.html).
+#  For these datasets, the fuel moisture for a given day is provided the day after. For instance,
+#  the fuel moisture on 8/08/2025 is provided on 8/09/2025. This means we cannot assume that we have
+#  the fuel moisture for 8/08/2025 to predict the intensity of events on 8/08/2025. Instead we must
+#  use the information we have available in real-time, and we want the dataset to reflect this.
+
+#Desired state of datasets:
+#  Daily:
+#    For covariates that update daily, use previous day. For 6hr covariates, use observed values
+#    at noon of the previous day.
+#  6hr:
+#    For predicting at some given time step (e.g. jan 1 for 12-6pm)
+#    Use most recent covs (previous day for MarcosCovs, 12pm for MichellesCovs for 12-6pm)
+
+#Current state of dataset:
+#  MarcosCovs:
+#    Elevation - static, does not change. Does not need to be adjusted.
+#    NDVI/EVI - Uses most recent satellite observation in each grid cell. Updated every ~8 days.
+#      These were already crawled by taking the *most recent observation* for any given day. Thus it
+#      already reflects using the most recent available information, so no adjustment is needed.
+#    fm100/fm1000 - Currently has each day's observation. Since updated one day ahead, everything
+#      needs to be shifted backwards one day. Thus we need fm100/fm1000 of 2019 for jan 1 of 2020.
+
 import xarray as xr
-import geopandas as gpd
-import torch
-from shapely.geometry import Point
-from shapely.geometry import box
+import pandas as pd
+import Functions
+from pathlib import Path
 import numpy as np
-import pyogrio
 
-def get_events(year):
-    """
-    Reads event files from Data/EventData to get all fire events for a given year (with times and locations)
-    """
-    PGE_path = f'Data/EventData/PGE_{year}.xlsx'
-    SCE_path = f'Data/EventData/SCE_{year}.xlsx'
-    SDGE_path = f'Data/EventData/SDGE_{year}.xlsx'
-    PGE_data = pd.read_excel(PGE_path)
-    SCE_data = pd.read_excel(SCE_path)
-    SDGE_data = pd.read_excel(SDGE_path)
-fp = "Data\\Consolidated PSPS Data 20251231.gdb"
-pyogrio.list_layers(fp)
-psps = gpd.read_file(fp, driver="OpenFileGDB", layer='PSPS_Map_20251231')
+#FIRST: adjust fm100 and fm1000 forward by one day. as an intermediate step, the adjusted datasets will be
+#put into a new directory, Data/AdjustedMarcosCovs
+years = [2020, 2021, 2022, 2023, 2024]
+varnames = ["fm100", "fm1000"]
 
-#First make the california grid with 0.24 degree resolution
-pad, dx = 0.30, 0.24 #Grid dimensions
+nc_dir = Path("Data/MarcosCovs")
+nc_pattern = "daily_gridded_CA_{year}.nc"
 
-#Note that the CA bounding box in epsg4326 is (-124.409591, 32.534156, -114.131211, 42.009518)
-xmin, xmax = -124.409591-pad, -114.131211+pad
-ymin, ymax = 32.534156-pad, 42.009518+pad
+out_dir = Path("Data/AdjustedMarcosCovs")
+out_dir.mkdir(parents=True, exist_ok=True)
 
-cells = [box(x, y, x+dx, y+dx)               # square cells
-         for x in np.arange(xmin, xmax, dx)
-         for y in np.arange(ymin, ymax, dx)]
-grid_gdf = gpd.GeoDataFrame({"cell_id": range(len(cells))}, geometry=cells, crs=4326)
+#2019 december 31 fuel moisture paths
+seed_tifs = {
+    "fm100":  Path("Data/fuelmoisture_2019_dec31/fm100_2019_dec31.tif"),
+    "fm1000": Path("Data/fuelmoisture_2019_dec31/fm1000_2019_dec31.tif"),
+}
 
-#California outline
-#downloading county polygons, "FIPS : 06" is Califirnia
-ca = (gpd.read_file("https://raw.githubusercontent.com/plotly/datasets/master/geojson-counties-fips.json")
-      .loc[lambda d: d.id.str.startswith("06")]
-      .to_crs(4326) # ensure same CRS
-      .dissolve()) # single polygon
+#make grid
+grid_gdf = Functions.get_point24deg_grid()
+grid_gdf_base = grid_gdf.copy() #for realigning if necessary
 
-#Keep only grid cells that intersect California
-grid_gdf = grid_gdf.loc[grid_gdf.geometry.intersects(ca.geometry.iloc[0])].reset_index(drop=True)
+seed_agg_cache = {}
+for v in varnames:
+    seed_agg_cache[v] = Functions.aggregate_tif_to_cells(seed_tifs[v], grid_gdf_base, stats="mean")
 
-event_csv = "data\\all_samples_2024.csv"
-raster_nc = "daily_gridded_CA_2024.nc"
+for v in varnames:
+    carry = None #last-day array carried into the next year
 
-def build_event_tensor(event_csv, raster_nc, grid_gdf):
-    #Load event data
-    events = pd.read_csv(event_csv)
-    events = events[events['label'] == 1]
-    events["geometry"] = events.apply(lambda row: Point(row["lon"], row["lat"]), axis=1)
-    #Convert event time to indexable format
-    events["time"] = pd.to_datetime(events["date"])
-    gdf_events = gpd.GeoDataFrame(events, geometry="geometry", crs=grid_gdf.crs)
+    for y in years:
+        in_path  = nc_dir / nc_pattern.format(year=y)
+        out_path = out_dir / nc_pattern.format(year=y)
 
-    #Spatial join to assign each event to a grid cell
-    gdf_joined = gpd.sjoin(gdf_events, grid_gdf, how="left", predicate="within")
-    if gdf_joined.isnull().any().any():
-        raise ValueError("Some events did not match any grid cell!")
+        ds = xr.load_dataset(in_path)
 
-    #Compute centroids of matched cells
-    centroids = grid_gdf.copy().to_crs('EPSG:26910').geometry.centroid.to_crs('EPSG:4326')
-    gdf_joined["x_centroid"] = gdf_joined["index_right"].apply(lambda i: centroids.iloc[i].x)
-    gdf_joined["y_centroid"] = gdf_joined["index_right"].apply(lambda i: centroids.iloc[i].y)
+        #align polygons to this file's cell ordering
+        grid_gdf_aligned, idxs = Functions.ensure_grid_order_matches(ds, grid_gdf_base, id_col="cell_id")
 
-    #Load raster NetCDF
-    ds = xr.open_dataset(raster_nc)
+        #build the seed for the first day of this year:
+        if y == years[0]:
+            #2020: use aggregated 2019-12-31 TIFF
+            seed_full_order = seed_agg_cache[v]
+            seed_aligned = seed_full_order[idxs]
+            first_day_value = seed_aligned
+        else:
+            #2021...: use carry (which we saved as the last day of previous year's original data)
+            if carry is None:
+                raise RuntimeError("Carry is None for a year > first. Logic error.")
+            first_day_value = carry
 
+        #apply shift within this year
+        old = ds[v].values #shape (T, C)
+        new = Functions.shift_forward_one_year(old, first_day_value)  #shape (T, C)
+
+        #update the dataset variable values
+        ds[v].values[:] = new
+
+        #prepare carry for next year; the last day of this year's ORIGINAL data becomes first day of next year
+        carry = old[-1, :].copy()
+
+        #write out the fixed file
+        ds.to_netcdf(out_path)
+        ds.close()
+
+#NEXT: using adjusted datasets from above, combine with MichellesCovs for each year in years.
+years = [2023, 2024]
+
+nc_dir = Path("Data/AdjustedMarcosCovs")
+nc_pattern = "daily_gridded_CA_{year}.nc"
+
+csv_dir = Path("Data/MichellesCovs")
+csv_pattern = "California_HRRR_daily{year}06.csv"
+
+out_dir = Path("Data/CombinedCovs")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for y in years:
+    in_path_nc = nc_dir / nc_pattern.format(year=y)
+    in_path_csv = csv_dir / csv_pattern.format(year=y)
+    out_path = out_dir / nc_pattern.format(year=y)
+
+    ds = xr.load_dataset(in_path_nc)
+    df = pd.read_csv(in_path_csv)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    #drop useless columns (most are all zeros, Geopotential height is unneeded because we already have elevation)
+    df = df.drop(columns=["Cloud mixing ratio", 
+    "Fraction of cloud cover", 
+    "Geopotential height",
+    "Graupel (snow pellets)",
+    "Rain mixing ratio",
+    "Snow mixing ratio",
+    "unknown",
+    "Latitude",
+    "Longitude"])
+
+    #loop thru all columns except date and convert to numeric
+    exclude = "Date"
+    include = [col for col in df.columns if col != exclude]
+    for col in include: 
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     
-    #extract lon/lat coordinates for all cells (1D array)
-    lons = ds["lon"].values  # shape: [num_cells]
-    lats = ds["lat"].values  # shape: [num_cells]
-    cell_ids = ds["cell"].values  # dimension over which lon/lat are indexed
+    #drop na and drop duplicates; usually resolves errors where we have extra rows
+    df = df.dropna()
+    df = df.drop_duplicates()
+    df["Cell_ID"] = df["Cell_ID"].astype(ds["cell"].dtype) #make cell ids match datatypes
 
-    #raster variables 
-    covariate_names = list(ds.data_vars)
+     
 
-    marks = []
-    for i, row in gdf_joined.iterrows():
-        t = pd.to_datetime(row["time"])
-        x = row["lon"]
-        y = row["lat"]
+    #make xarray dataset out of the csv
+    df_xr = (
+            df.set_index(["Date", "Cell_ID"])
+              .to_xarray()
+              .rename({"Date": "time", "Cell_ID": "cell"})
+              .transpose("time", "cell", ...)
+        )
+    #Align exactly to ds coords
+    df_xr = df_xr.reindex_like(ds)
+    #align indices with the other ds
+    #df_xr = df_xr.reindex(time=ds.time, cell=ds.cell)
+    ds_out = xr.merge([ds, df_xr], compat="no_conflicts")
+    for v in set(df_xr.data_vars) - set(ds.data_vars):
+         frac = 1 - np.isnan(ds_out[v]).mean().item()
+         print(y, v, "non-NaN coverage:", f"{100*frac:.2f}%")
+    ds_out.to_netcdf(out_path)
 
-        # compute distance to each cell centroid
-        dists = np.sqrt((lons - x)**2 + (lats - y)**2)
-        closest_cell = cell_ids[np.argmin(dists)]  # scalar
-
-        # extract covariates at nearest time and nearest cell
-        sampled = ds.sel(time=t, method="nearest").sel(cell=closest_cell)
-
-        values = [float(sampled[var].values) for var in covariate_names]
-        marks.append(values)
-    marks = torch.FloatTensor(marks)  # [seq_len, d]
-
-    # Assemble full tensor: [time, x_centroid, y_centroid, *marks]
-    time_values = torch.FloatTensor(pd.to_datetime(gdf_joined["time"]).dt.dayofyear)  #to day of year
-    x_c = torch.FloatTensor(gdf_joined["x_centroid"].values)
-    y_c = torch.FloatTensor(gdf_joined["y_centroid"].values)
-
-    X_seq = torch.cat([
-        time_values.unsqueeze(1),
-        x_c.unsqueeze(1),
-        y_c.unsqueeze(1),
-        marks
-    ], dim=1)  # [seq_len, data_dim]
-
-    # Final output: batch size = 1
-    X_final = X_seq.unsqueeze(0)  # [1, seq_len, data_dim]
-    return X_final, covariate_names #tensor, ordered covariate names
-data, covs = build_event_tensor(event_csv, raster_nc, grid_gdf)
-
-#first, divide time by 365 to normalize it to (0,1)
-data[:,:,0] = data[:,:,0] / 365.0
-
-#GRID CENTROIDS
-#compute centroids
-centroids = grid_gdf.copy().to_crs('EPSG:26910').geometry.centroid.to_crs('EPSG:4326')
-#extract x and y coordinates
-xs = torch.tensor(centroids.x.values, dtype=torch.float32)  # [num_cells]
-ys = torch.tensor(centroids.y.values, dtype=torch.float32)  # [num_cells]
-
-#stack into a tensor
-grid_cells = torch.stack([xs, ys], dim=1)  # [num_cells, 2]
-
-
-#(divide space)
-
-
-# training data preparation
-train_dataset = TensorDataset(batch)
-train_loader  = DataLoader(train_dataset, batch_size=4, shuffle=True)
-test_seq      = data[0].squeeze()
-
-# model configurations
-T          = (0., 1.)
-S          = [(0., 1.), (0., 1.), (0., 1.), (0., 1.), (0., 1.)] #we have 5 covariates here
-data_dim   = 8
-int_config = ("mc", 2000)
-init_model = DeepBasisPointProcess(
-    T=T, S=S, mu=1.,
-    n_basis=5, basis_dim=10, data_dim=data_dim, 
-    int_config=int_config, grid_cells = grid_cells,
-    init_gain=0.01, init_bias=0.01, init_std=1,
-    nn_width=10)
+#import matplotlib.pyplot as plt
+#da = ds_out['Vertical velocity'].isel(time=10)
+#plt.figure()
+#plt.scatter(ds_out['lon'].values, ds_out['lat'].values,
+#            c=da.values, s=10, cmap='viridis')
+#plt.colorbar(label='Vertical velocity')
+#plt.xlabel('lon'); plt.ylabel('lat'); plt.title('Vertical velocity @ time=0')
+#np.sum(np.isnan(ds_out['Vertical velocity'].values))
