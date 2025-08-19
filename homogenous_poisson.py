@@ -14,3 +14,17 @@ print(lam)
 #Nloglam - lam(TC)
 loglik = N*np.log(lam) - lam*T*C
 print(loglik) #very low!
+
+
+#For only 2023 and 2024:
+counts = [Functions.get_events(year).shape[0] for year in range(2023,2025)]
+N = sum(counts)
+T = 366 + 365
+C = Functions.get_point24deg_grid(drop_missing_cov_cells=True).shape[0]
+#So our MLE is
+lam = N/(T*C)
+print(lam)
+#And our log likelihood is
+#Nloglam - lam(TC)
+loglik = N*np.log(lam) - lam*T*C
+print(loglik) #very low!

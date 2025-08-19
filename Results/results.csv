@@ -1,0 +1,3 @@
+model_name,training_ll_cv,valid_ll_cv,overall_ll,cv_model_save_path,all_model_save_path
+Poisson_GLM_Marcoscovs,-16164.18701171875,-4725.4462890625,-20887.64990234375,SavedModels/Poisson_GLM_Marcoscovs_cv.pth,SavedModels/Poisson_GLM_Marcoscovs_all.pth
+Poisson_Neural_20_2_Marcoscovs,-15195.467041015625,-4459.20947265625,-19555.21826171875,SavedModels/Poisson_Neural_20_2_Marcoscovs_cv.pth,SavedModels/Poisson_Neural_20_2_Marcoscovs_all.pth

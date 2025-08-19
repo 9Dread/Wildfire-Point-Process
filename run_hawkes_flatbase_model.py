@@ -1,0 +1,32 @@
+import torch
+import torch.nn
+#import pyogrio
+from torch.utils.data import DataLoader
+import Functions
+from Modeling import HawkesDiffusionFlatbase
+from Modeling import train_model
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#get data
+covars = Functions.get_covs_tensor_list(True)
+events = Functions.get_events_tensor_list('daily', True)
+dataset = Functions.WildfireDataset(covars, events) #This model doesn't actually use covars, only references spacetime shape, so we don't have to standardize
+loader = DataLoader(dataset, batch_size=1, shuffle=True) 
+
+#model and optimizer
+grid_gdf = Functions.get_point24deg_grid(True)
+cell_coords = Functions.grid_to_cell_coords(grid_gdf, True)
+cell_coords = cell_coords/1000 #convert to km units, helps with gradients
+
+model = HawkesDiffusionFlatbase(cell_coords=cell_coords).to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-6) #1e-6
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+
+#training loop
+train_model(model, optimizer, loader, 10, device, print_iter=1)
+#3961.2657470703125.
+#over the training set: -7922.531494140625
+
+save_path = "SavedModels/hawkes_stddif_linbase_combinedcovs.pth"
+torch.save(model.state_dict(), save_path)

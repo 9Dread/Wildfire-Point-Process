@@ -120,10 +120,9 @@ for y in years:
     ds = xr.load_dataset(in_path_nc)
     df = pd.read_csv(in_path_csv)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    #drop useless columns (most are all zeros, Geopotential height is unneeded because we already have elevation)
+    #drop useless columns (most are all zeros)
     df = df.drop(columns=["Cloud mixing ratio", 
     "Fraction of cloud cover", 
-    "Geopotential height",
     "Graupel (snow pellets)",
     "Rain mixing ratio",
     "Snow mixing ratio",
@@ -158,7 +157,7 @@ for y in years:
     ds_out = xr.merge([ds, df_xr], compat="no_conflicts")
     for v in set(df_xr.data_vars) - set(ds.data_vars):
          frac = 1 - np.isnan(ds_out[v]).mean().item()
-         print(y, v, "non-NaN coverage:", f"{100*frac:.2f}%")
+         print(y, v, "non-NaN coverage:", f"{100*frac:.5f}%")
     ds_out.to_netcdf(out_path)
 
 #import matplotlib.pyplot as plt

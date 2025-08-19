@@ -6,9 +6,8 @@ from shapely.geometry import Point
 from shapely.geometry import box
 import numpy as np
 #import pyogrio
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import imageio
 from rasterstats import zonal_stats
 from matplotlib.colors import LogNorm, Normalize
@@ -188,7 +187,7 @@ def tensor_gridded_covs_new(year, drop_missing_cov_cells = False):
     array = nc_dataset.to_array()
     array = array.transpose("time", "cell", "variable") #reorder stuff
     arr = array.values #shape (T, C, p)
-    return(torch.from_numpy(arr).float())
+    return(torch.from_numpy(arr).float(), list(nc_dataset.data_vars.keys()))
 
 def get_covs_tensor_list(drop_missing_cov_cells = False, new = False):
     """
@@ -197,7 +196,12 @@ def get_covs_tensor_list(drop_missing_cov_cells = False, new = False):
     if new:
         #we only have 2023, 2024 for now
         years = [2023, 2024]
-        return([tensor_gridded_covs_new(year, drop_missing_cov_cells) for year in years]) 
+        tensor_list = []
+        for year in years:
+            tensor, names_list = tensor_gridded_covs_new(year, drop_missing_cov_cells)
+            tensor_list.append(tensor)
+        #return list of tensors, variable names
+        return(tensor_list, names_list) 
     else:
         years = [2020, 2021, 2022, 2023, 2024]
         return([tensor_gridded_covs(year, drop_missing_cov_cells) for year in years])    
@@ -384,7 +388,7 @@ def animate_poisson_intensity(model, cov_tensor, events, cell_coords, output_pat
     fig, ax = plt.subplots(figsize=figsize)
     sc_int = ax.scatter(xs, ys, c=lam[0],
                         vmin=lam.min(), vmax=lam.max(), s=20, cmap="OrRd")
-    sc_evt = ax.scatter(xs, ys, s=0, alpha=0.0)
+    sc_evt = ax.scatter(xs, ys, s=0, c="#78e8ff", alpha=0.0)
     plt.colorbar(sc_int, ax=ax, label='lambda intensity')
     ax.set_axis_off()
 
@@ -397,7 +401,7 @@ def animate_poisson_intensity(model, cov_tensor, events, cell_coords, output_pat
         #update decaying event size + alpha
         event_disp = event_disp * decay + ev[t].cpu().numpy()
         event_disp = np.clip(event_disp, 0.0, 1.0)
-        sc_evt.set_sizes(200 * event_disp)
+        sc_evt.set_sizes(100 * event_disp)
         sc_evt.set_alpha(event_disp)
         ax.set_title(f"Time step {t}")
         return sc_int, sc_evt
@@ -514,9 +518,9 @@ def animate_hawkes_intensity(model, cov_tensor, events, cell_coords, output_path
         norm_exc_log, norm_exc_lin = _log_norm_from_pos(exc)
         fig2, ax2 = plt.subplots(figsize=figsize)
         if norm_exc_log is not None:
-            sc_int2 = ax2.scatter(xs, ys, c=exc[0], norm=norm_exc_log, s=20, cmap="OrRd")
+            sc_int2 = ax2.scatter(xs, ys, c=exc[0], norm=norm_exc_log, s=20, cmap="magma")
         else:
-            sc_int2 = ax2.scatter(xs, ys, c=exc[0], norm=norm_exc_lin, s=20, cmap="OrRd")
+            sc_int2 = ax2.scatter(xs, ys, c=exc[0], norm=norm_exc_lin, s=20, cmap="magma")
 
         cbar2 = plt.colorbar(sc_int2, ax=ax2, label='excitation intensity', format=LogFormatterMathtext())
         if norm_exc_log is not None:
