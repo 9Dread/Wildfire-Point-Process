@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader
 import Functions
 from Modeling import HawkesDiffusionFlatbase
 from Modeling import train_model
+from torch.optim.lr_scheduler import LambdaLR
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -20,11 +22,17 @@ cell_coords = Functions.grid_to_cell_coords(grid_gdf, True)
 cell_coords = cell_coords/1000 #convert to km units, helps with gradients
 
 model = HawkesDiffusionFlatbase(cell_coords=cell_coords).to(device)
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-6) #1e-6
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+optimizer = torch.optim.SGD(model.parameters(), lr=1e-6) #1e-6, x10 every 20 until 1e-5
+def lambda_update(epoch):
+    if 10 ** (epoch // 20) < 10:
+        return 10 ** (epoch // 20)
+    else:
+        return 10 ** 1
+scheduler = LambdaLR(optimizer, lambda_update)
+#optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
 
 #training loop
-train_model(model, optimizer, loader, 10, device, print_iter=1)
+train_model(model, optimizer, loader, 250, device, scheduler, print_iter=1)
 #3961.2657470703125.
 #over the training set: -7922.531494140625
 
