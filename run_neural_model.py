@@ -2,7 +2,7 @@ import torch
 import torch.nn
 #import pyogrio
 from torch.utils.data import DataLoader
-import Functions
+from DataProcessing import get_covs_tensor_list, get_events_tensor_list, standardize_cov_tensors, WildfireDataset, get_point24deg_grid, grid_to_cell_coords
 from Modeling import PoissonNeuralIntensity
 from Modeling import train_model
 from torch.optim.lr_scheduler import LambdaLR
@@ -10,14 +10,14 @@ from torch.optim.lr_scheduler import LambdaLR
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #get data
-covars = Functions.get_covs_tensor_list(True)
-events = Functions.get_events_tensor_list('daily', True)
+covars = get_covs_tensor_list(True)
+events = get_events_tensor_list('daily', True)
 
 #mean/stddev standardization
-covars = Functions.standardize_cov_tensors(covars)
+covars = standardize_cov_tensors(covars)
 
 #data loader
-dataset = Functions.WildfireDataset(covars, events)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
 hidden_dim = 20

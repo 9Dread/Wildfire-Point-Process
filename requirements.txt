@@ -1,0 +1,11 @@
+rasterio==1.4.3
+rasterstats==0.20.0
+xarray==2025.4.0
+torch==2.6.0+cu126
+imageio==2.37.0
+matplotlib==3.8.4
+pandas==2.2.3
+geopandas==1.0.1
+shapely==2.1.1
+openpyxl==3.1.5
+

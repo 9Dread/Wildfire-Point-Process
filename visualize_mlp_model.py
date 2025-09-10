@@ -1,6 +1,7 @@
-import Functions
 import torch
 import torch.nn
+from DataProcessing import get_covs_tensor_list, get_events_tensor_list, standardize_cov_tensors, WildfireDataset, get_point24deg_grid, grid_to_cell_coords
+from Visualization import animate_intensity
 from Modeling import PoissonNeuralIntensity
 from torch.utils.data import DataLoader
 
@@ -8,12 +9,12 @@ hidden_dim = 100
 num_hidden_layers = 10
 
 #get data
-covars = Functions.get_covs_tensor_list(True)
-events = Functions.get_events_tensor_list('daily', True)
+covars = get_covs_tensor_list(True)
+events = get_events_tensor_list('daily', True)
 #mean/stddev standardization
-covars = Functions.standardize_cov_tensors(covars)
+covars = standardize_cov_tensors(covars)
 #data loader
-dataset = Functions.WildfireDataset(covars, events)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=False)
 data_list = [[covs, event_mask] for covs, event_mask in loader]
 
@@ -26,9 +27,11 @@ model.eval() #eval mode
 
 #Lets do 2024 first
 covs = data_list[4][0]
-events = data_list[4][1]
+event = data_list[4][1]
 #get centroids
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_centroids = Functions.grid_to_cell_coords(grid_gdf)
+grid_gdf = get_point24deg_grid(True)
+cell_centroids = grid_to_cell_coords(grid_gdf)
 
-Functions.animate_poisson_intensity(model, covs, events, cell_centroids, f"Viz/wildfire_intensity_2024_mlp_{hidden_dim}_{num_hidden_layers}.gif", decay=0.9)
+with torch.no_grad():
+    lam = model(covs)
+animate_intensity(lam, 'lambda intensity', event, cell_centroids, f"Viz/wildfire_intensity_2024_mlp_{hidden_dim}_{num_hidden_layers}.gif", decay=0.9)

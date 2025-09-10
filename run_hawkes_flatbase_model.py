@@ -2,21 +2,21 @@ import torch
 import torch.nn
 #import pyogrio
 from torch.utils.data import DataLoader
-import Functions
+from DataProcessing import get_covs_tensor_list, get_events_tensor_list, WildfireDataset, get_point24deg_grid, grid_to_cell_coords
 from Modeling import HawkesDiffusionFlatbase
 from Modeling import train_model
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #get data
-covars = Functions.get_covs_tensor_list(True)
-events = Functions.get_events_tensor_list('daily', True)
-dataset = Functions.WildfireDataset(covars, events) #This model doesn't actually use covars, only references spacetime shape, so we don't have to standardize
+covars = get_covs_tensor_list(True)
+events = get_events_tensor_list('daily', True)
+dataset = WildfireDataset(covars, events) #This model doesn't actually use covars, only references spacetime shape, so we don't have to standardize
 loader = DataLoader(dataset, batch_size=1, shuffle=True) 
 
 #model and optimizer
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_coords = Functions.grid_to_cell_coords(grid_gdf, True)
+grid_gdf = get_point24deg_grid(True)
+cell_coords = grid_to_cell_coords(grid_gdf, True)
 cell_coords = cell_coords/1000 #convert to km units, helps with gradients
 
 model = HawkesDiffusionFlatbase(cell_coords=cell_coords).to(device)

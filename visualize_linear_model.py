@@ -1,19 +1,17 @@
-import Functions
+from DataProcessing import get_covs_tensor_list, get_events_tensor_list, standardize_cov_tensors, WildfireDataset, get_point24deg_grid, grid_to_cell_coords
+from Visualization import animate_intensity
 import torch
-import torch.nn
-import numpy as np
-import imageio
 from Modeling import PoissonLinearIntensity
 from torch.utils.data import DataLoader
 
 #MarcosCovs visualization:
 #get data
-covars = Functions.get_covs_tensor_list(True)
-events = Functions.get_events_tensor_list('daily', True)
+covars = get_covs_tensor_list(True)
+events = get_events_tensor_list('daily', True)
 #mean/stddev standardization
-covars = Functions.standardize_cov_tensors(covars)
+covars = standardize_cov_tensors(covars)
 #data loader
-dataset = Functions.WildfireDataset(covars, events)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=False)
 data_list = [[covs, events] for covs, events in loader]
 
@@ -24,7 +22,7 @@ state_dict = torch.load("SavedModels/poisson_glm_marcoscovs.pth", map_location="
 model.load_state_dict(state_dict)
 model.eval() #eval mode
 
-weights = model.linear.weight.detach().cpu().numpy().reshape(-1)  # shape (p,)
+weights = model.linear.weight.detach().cpu().numpy().reshape(-1)  #shape (p,)
 bias = model.linear.bias.detach().cpu().item()
 print("Intercept (B):", bias)
 for name, w in zip(["NDVI", "EVI", "fm100", "fm1000", "elevation"], weights):
@@ -34,18 +32,21 @@ for name, w in zip(["NDVI", "EVI", "fm100", "fm1000", "elevation"], weights):
 covs = data_list[4][0]
 event = data_list[4][1]
 #get centroids
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_centroids = Functions.grid_to_cell_coords(grid_gdf)
+grid_gdf = get_point24deg_grid(True)
+cell_centroids = grid_to_cell_coords(grid_gdf)
 
-Functions.animate_poisson_intensity(model, covs, event, cell_centroids, "Viz/wildfire_intensity_2024_glm_marcoscovs.gif", decay=0.9)
+with torch.no_grad():
+    lam = model(covs)
+
+animate_intensity(lam, 'lambda intensity', event, cell_centroids, "Viz/wildfire_intensity_2024_glm_marcoscovs.gif", decay=0.9)
 
 
 #CombinedCovs:
-covars, var_names = Functions.get_covs_tensor_list(True, True)
-events = Functions.get_events_tensor_list('daily', True)
+covars, var_names = get_covs_tensor_list(True, True)
+events = get_events_tensor_list('daily', True)
 events = [events[3], events[4]] #2023 and 2024
-covars = Functions.standardize_cov_tensors(covars)
-dataset = Functions.WildfireDataset(covars, events)
+covars = standardize_cov_tensors(covars)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=False)
 data_list = [[covs, events] for covs, events in loader]
 
@@ -55,7 +56,7 @@ state_dict = torch.load("SavedModels/poisson_glm_combinedcovs.pth", map_location
 model.load_state_dict(state_dict)
 model.eval() #eval mode
 
-weights = model.linear.weight.detach().cpu().numpy().reshape(-1)  # shape (p,)
+weights = model.linear.weight.detach().cpu().numpy().reshape(-1)  #shape (p,)
 bias = model.linear.bias.detach().cpu().item()
 print("Intercept (B):", bias)
 for name, w in zip(var_names, weights):
@@ -63,6 +64,10 @@ for name, w in zip(var_names, weights):
 
 covs = data_list[1][0]
 event = data_list[1][1]
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_centroids = Functions.grid_to_cell_coords(grid_gdf)
-Functions.animate_poisson_intensity(model, covs, event, cell_centroids, "Viz/wildfire_intensity_2024_glm_combinedcovs.gif", decay=0.9)
+grid_gdf = get_point24deg_grid(True)
+cell_centroids = grid_to_cell_coords(grid_gdf)
+
+with torch.no_grad():
+    lam = model(covs)
+
+animate_intensity(lam, 'lambda intensity', event, cell_centroids, "Viz/wildfire_intensity_2024_glm_combinedcovs.gif", scale='log', decay=0.9)

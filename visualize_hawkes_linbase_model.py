@@ -1,26 +1,27 @@
-import Functions
+from Visualization import animate_intensity
 import torch
+from DataProcessing import get_covs_tensor_list, get_events_tensor_list, standardize_cov_tensors, WildfireDataset, get_point24deg_grid, grid_to_cell_coords
 from Modeling import HawkesDiffusionLinbase
 from torch.utils.data import DataLoader
 
 #get data
-covars, var_names = Functions.get_covs_tensor_list(True, True)
-events = Functions.get_events_tensor_list('daily', True)
+covars, var_names = get_covs_tensor_list(True, True)
+events = get_events_tensor_list('daily', True)
 events = [events[3], events[4]] #2023 and 2024 for now
 
 #mean/stddev standardization
-covars = Functions.standardize_cov_tensors(covars)
+covars = standardize_cov_tensors(covars)
 
 #data loader
-dataset = Functions.WildfireDataset(covars, events)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=False)
 data_list = [[covs, events] for covs, events in loader]
 
 #Load the pretrained model
 p = covars[0].shape[2] #number of covariates
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_coords_model = Functions.grid_to_cell_coords(grid_gdf, True) / 1000
-cell_coords_viz = Functions.grid_to_cell_coords(grid_gdf) #latlon, not metric
+grid_gdf = get_point24deg_grid(True)
+cell_coords_model = grid_to_cell_coords(grid_gdf, True) / 1000
+cell_coords_viz = grid_to_cell_coords(grid_gdf) #latlon, not metric
 
 model = HawkesDiffusionLinbase(num_covariates=p, cell_coords=cell_coords_model)
 
@@ -44,23 +45,28 @@ print("Sigma (excitation kernel; KM units): ", sigma)
 #Lets do 2024 first
 covs = data_list[1][0]
 event = data_list[1][1]
-
-Functions.animate_hawkes_intensity(model, covs, event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_combinedcovs", decay=0.9,separate_base_ker=True)
+with torch.no_grad():
+    lam, parts = model(covs, event, return_parts=True)
+base = parts['baseline']
+exc = parts['excitation']
+animate_intensity(base, 'baseline intensity', event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_combinedcovs_base.gif", decay=0.9)
+animate_intensity(exc, 'excitation intensity', event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_combinedcovs_exc.gif", cmap='magma', scale='log', decay=0.9)
+animate_intensity(lam, 'lambda intensity', event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_combinedcovs_lam.gif", scale='log', decay=0.9)
 
 
 #marcoscovs:
 
-covars = Functions.get_covs_tensor_list(True)
-events = Functions.get_events_tensor_list('daily', True)
+covars = get_covs_tensor_list(True)
+events = get_events_tensor_list('daily', True)
 #mean/stddev standardization
-covars = Functions.standardize_cov_tensors(covars)
-dataset = Functions.WildfireDataset(covars, events)
+covars = standardize_cov_tensors(covars)
+dataset = WildfireDataset(covars, events)
 loader = DataLoader(dataset, batch_size=1, shuffle=False)
 data_list = [[covs, events] for covs, events in loader]
 p = covars[0].shape[2] #number of covariates
-grid_gdf = Functions.get_point24deg_grid(True)
-cell_coords_model = Functions.grid_to_cell_coords(grid_gdf, True) / 1000
-cell_coords_viz = Functions.grid_to_cell_coords(grid_gdf)
+grid_gdf = get_point24deg_grid(True)
+cell_coords_model = grid_to_cell_coords(grid_gdf, True) / 1000
+cell_coords_viz = grid_to_cell_coords(grid_gdf)
 model = HawkesDiffusionLinbase(num_covariates=p, cell_coords=cell_coords_model)
 state_dict = torch.load("SavedModels/hawkes_stddif_linbase_marcoscovs.pth", map_location="cpu")  
 model.load_state_dict(state_dict)
@@ -80,4 +86,9 @@ print("Sigma (excitation kernel; KM units): ", sigma)
 
 covs = data_list[4][0]
 event = data_list[4][1]
-Functions.animate_hawkes_intensity(model, covs, event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_marcoscovs", decay=0.9,separate_base_ker=True)
+with torch.no_grad():
+    lam, parts = model(covs, event, return_parts=True)
+base = parts['baseline']
+exc = parts['excitation']
+animate_intensity(base, 'baseline intensity', event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_marcoscovs_base.gif", decay=0.9)
+animate_intensity(exc, 'excitation intensity', event, cell_coords_viz, "Viz/wildfire_intensity_2024_hawksstddif_marcoscovs_exc.gif", cmap='magma', scale='log', decay=0.9)
