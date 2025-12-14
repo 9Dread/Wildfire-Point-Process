@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import os
 
-def train_model(model, optimizer, loader, max_epochs, device, scheduler = None, delta_loss = 0.01, improve_epochs = 5, print_iter = 10):
+def train_model(model, optimizer, loader, max_epochs, device, scheduler = None, delta_loss = 0.01, improve_epochs = 5, batch_size = 1, print_iter = 10):
     """
     Runs a training loop with early stopping.
     model: one of the model classes initialized; must have loglik function
@@ -38,7 +38,8 @@ def train_model(model, optimizer, loader, max_epochs, device, scheduler = None, 
         total_nll = 0.0
         if avg_nll is not None:
             prev_loss = avg_nll #update prev_loss from previous iteration
-        for tup in loader:
+        optimizer.zero_grad()
+        for i, tup in enumerate(loader):
             #if without inhib, get cov events; else get all
             #move to device, squeeze batch‐dim
             if len(tup) == 2:
@@ -56,9 +57,10 @@ def train_model(model, optimizer, loader, max_epochs, device, scheduler = None, 
                 nll = -model.loglik(cov, inhib, events)
 
             #backward & step
-            optimizer.zero_grad()
-            nll.backward()
-            optimizer.step()
+            (nll/batch_size).backward()
+            if ((i + 1) % batch_size == 0) or (i+1 == len(loader)):
+                optimizer.step()
+                optimizer.zero_grad()
 
             total_nll += nll.item()
         avg_nll = total_nll / len(loader)
@@ -103,7 +105,7 @@ def train_model(model, optimizer, loader, max_epochs, device, scheduler = None, 
     print("This makes the total log likelihood over the training set: " + str(-(avg_nll * len(loader))))
     return -(avg_nll * len(loader))
 
-def cross_validation(model, optimizer, lr, covars, events, device, scheduler = None, delta_loss = 0.01, improve_epochs = 5, print_iter = 10, save_results=True, save_path = None, model_name = None, train_on_all=True):
+def cross_validation(model, optimizer, lr, covars, events, device, inhs = None, scheduler = None, delta_loss = 0.01, improve_epochs = 5, print_iter = 10, save_results=True, save_path = None, model_name = None, train_on_all=True, batch_size = 1):
     """
     cross validation routine using 2024 as the test set.
 
@@ -113,6 +115,7 @@ def cross_validation(model, optimizer, lr, covars, events, device, scheduler = N
     covars: a list of tensors of shape (T_y, C, p); spacetime grid of covariates
     events: a list of tensors of shape (N_y, 2) containing the time and space indices of each event occurrence
     device: a pytorch device
+    inhs: inhibitory effect mask tensors (psps/epss). pass these if training an inhib model.
     scheduler: optional, either ['LambdaLR', function] or ['Plateau']; LambdaLR useful for SGD, plateau useful for Adam
     delta_loss: passed to train_model
     improve_epochs: passed to train_model
@@ -135,7 +138,11 @@ def cross_validation(model, optimizer, lr, covars, events, device, scheduler = N
     #make data loader for 2020-2023
     training_covars = [covars[j] for j in range(0, len(covars) - 1)]
     training_events = [events[j] for j in range(0, len(covars) - 1)]
-    dataset = WildfireDataset(training_covars, training_events)
+    if inhs is not None:
+        training_inhs = [inhs[k] for k in range(0, len(inhs))]
+        dataset = WildfireInhibDataset(training_covars, training_inhs, training_events)
+    else:
+        dataset = WildfireDataset(training_covars, training_events)
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     
@@ -157,21 +164,27 @@ def cross_validation(model, optimizer, lr, covars, events, device, scheduler = N
                 sched = LambdaLR(optim, lr_lambda=scheduler[1])
             else:
                 sched = ReduceLROnPlateau(optim, 'min', threshold=1e-2, threshold_mode = 'abs')
-        training_ll = train_model(model_copy, optim, loader, 1000000, device, scheduler=sched, delta_loss=delta_loss, improve_epochs = improve_epochs, print_iter=print_iter)
+        training_ll = train_model(model_copy, optim, loader, 1000000, device, scheduler=sched, delta_loss=delta_loss, improve_epochs = improve_epochs, batch_size = batch_size, print_iter=print_iter)
     out_list.append(training_ll / 4)
     save_cv_model_path = f"SavedModels/{model_name}_cv.pth"
     torch.save(model_copy.state_dict(), save_cv_model_path)
 
 
     #evaluate loglik on unseen data:
-    loglik = float(model_copy.loglik(covars[len(covars)-1].to(device), events[len(covars)-1].int().to(device)))
+    if inhs is not None:
+        loglik = float(model_copy.loglik(covars[len(covars)-1].to(device), inhs[len(covars)-1].to(device), events[len(covars)-1].int().to(device)))
+    else:
+        loglik = float(model_copy.loglik(covars[len(covars)-1].to(device), events[len(covars)-1].int().to(device)))
     out_list.append(loglik)
 
     save_full_model_path = None
     all_ll = None
     #train on all data if train_on_all = true
     if train_on_all:
-        dataset = WildfireDataset(covars, events)
+        if inhs is not None:
+            dataset = WildfireInhibDataset(covars, inhs, events)
+        else:
+            dataset = WildfireDataset(covars, events)
         loader = DataLoader(dataset, batch_size=1, shuffle=True)
         while all_ll is None:
             #if we get NaN loss, retry and keep going:
@@ -218,6 +231,7 @@ def cross_validation(model, optimizer, lr, covars, events, device, scheduler = N
     return out_list
 
 
+
 class PoissonLinearIntensity(nn.Module):
     """
     Poisson-GLM intensity model with log-link (the canonical link function)
@@ -226,9 +240,10 @@ class PoissonLinearIntensity(nn.Module):
     Output: lam of shape (T, C)
 
     """
-    def __init__(self, num_covariates: int, bias: bool = True):
+    def __init__(self, num_covariates: int, bias: bool = True, sixhr = False):
         super().__init__()
         self.linear = nn.Linear(num_covariates, 1, bias=bias)
+        self.sixhr = sixhr
 
     def forward(self, cov: torch.Tensor) -> torch.Tensor:
         """ 
@@ -257,6 +272,32 @@ class PoissonLinearIntensity(nn.Module):
         returns the log-likelihood of the year.
         """
         lam = self.forward(cov) #(T,C)
+        if self.sixhr:
+            #evaluate daily likelihood
+            r = 4
+            T_f, C = lam.shape
+            T_c = T_f // r
+            rem = T_f % r
+            if rem != 0:
+                #handle remainder by padding with zeros for simplicity (or handle via bin edges)
+                pad = lam.new_zeros((r - rem, C))
+                lam_fine = torch.cat([lam, pad], dim=0)
+                T_f = lam_fine.shape[0]
+                T_c = T_f // r
+            #reshape (T_c, r, C) then sum across the r axis
+            lam_coarse = lam_fine.view(T_c, r, C).sum(dim=1)  #(T_c, C)
+
+            #aggregate events to daily resolution
+            T_fine = events[:,0]
+            cell = events[:,1]
+            T_coarse = T_fine // r
+            events_coarse = torch.stack([T_coarse, cell], dim=1)
+            event_T = events_coarse[:,0].long()
+            event_C = events_coarse[:,1].long()
+            event_lams = lam_coarse[event_T, event_C]  #(N_y)
+            logsum = torch.sum(torch.log(event_lams))
+            integral = torch.sum(lam_coarse)
+            return logsum - integral
         T_ids = events[:, 0]
         C_ids = events[:, 1]
         event_lams = lam[T_ids, C_ids] #(N_y) containing lambdas of events
@@ -508,13 +549,13 @@ class HawkesDiffusionLinbase(nn.Module):
 
 class PoissonLinPSPSEPSSFlat(nn.Module):
     """
-    Poisson linear + linear inhibition effects from PSPS/EPSS. Used for experimenting whether additive/multiplicative
+    Poisson linear + flat inhibition effects from PSPS/EPSS. Used for experimenting whether additive/multiplicative
     effects are more stable for PSPS/EPSS inhibition. Not using Hawkes kernel for testing because it is expensive.
     Input: cov of shape (T, C, p)
     Output: lam of shape (T, C)
 
     """
-    def __init__(self, num_covariates: int, init_psps: float = -5., init_epss: float = -7., bias: bool = True):
+    def __init__(self, num_covariates: int, init_psps: float = 0., init_epss: float = 0., bias: bool = True):
         #init_psps and init_epss negative so that the softplus is small
         super().__init__()
         self.linear = nn.Linear(num_covariates, 1, bias=bias)
@@ -525,11 +566,11 @@ class PoissonLinPSPSEPSSFlat(nn.Module):
         
     @property
     def psps(self):
-        return -F.softplus(self.raw_psps)
+        return torch.sigmoid(self.raw_psps)
     
     @property
     def epss(self):
-        return -F.softplus(self.raw_epss)
+        return torch.sigmoid(self.raw_epss)
 
     def _baseline(self, cov: torch.Tensor) -> torch.Tensor:
         """ 
@@ -561,9 +602,11 @@ class PoissonLinPSPSEPSSFlat(nn.Module):
         mask_epss = inhib[..., 1]  #(T, C)
 
         #apply masks
-        inhib_psps = self.psps * mask_psps
-        inhib_epss = self.epss * mask_epss
-        return inhib_psps + inhib_epss
+        eta_psps = self.psps * mask_psps
+        eta_epss = self.epss * mask_epss
+        inhib_psps = torch.where(mask_psps.bool(), eta_psps, torch.ones_like(eta_psps))
+        inhib_epss = torch.where(mask_epss.bool(), eta_epss, torch.ones_like(eta_epss))
+        return inhib_psps * inhib_epss
 
     def forward(self,
                 cov: torch.Tensor, #(T,C,p)
@@ -580,14 +623,11 @@ class PoissonLinPSPSEPSSFlat(nn.Module):
         lam_base = self._baseline(cov) #(T, C)
         lam_inhib = self._inhibition(inhib) #(T, C)
         if return_parts:
-            lam_total = lam_base + lam_inhib
-            #We need to recover exactly how much lam_inhib is affecting lam_total. We do not want extra magnitude that sends lam below 0.
-            negative_mask = (lam_total < 0).float()
-            lam_negative = torch.mul(lam_total, negative_mask) #only keep negative values
-            lam_inhib_fixed = lam_inhib + (-1 * lam_negative) #only retains the actual effects inhib had on lambda
-            return F.relu(lam_total), {"baseline": lam_base, 'inhib': lam_inhib_fixed}
-        lam_total = F.relu(lam_base + lam_inhib)
-        return lam_total
+            lam_total = lam_base * lam_inhib
+            #We need to recover exactly how much lam_inhib is affecting lam_total, i.e. how much lam_base decreases when multiplied by lam_inhib
+            lam_decreased = lam_base * -(1 - lam_inhib)
+            return lam_total, {"baseline": lam_base, 'inhib': lam_decreased}
+        return lam_base * lam_inhib
     
     def loglik(self, cov: torch.Tensor, inhib: torch.Tensor, events: torch.Tensor):
         """
@@ -744,8 +784,8 @@ class PoissonLinPSPSEPSSLinMult(nn.Module):
             self.inhib_feats = inhib_feats
         else:
             self.inhib_feats = list(range(0,num_covariates))
-        self.psps_linear = nn.Linear(len(self.inhib_feats), 1, bias=False)
-        self.epss_linear = nn.Linear(len(self.inhib_feats), 1, bias=False)
+        self.psps_linear = nn.Linear(len(self.inhib_feats), 1, bias=True)
+        self.epss_linear = nn.Linear(len(self.inhib_feats), 1, bias=True)
         
 
     def _baseline(self, cov: torch.Tensor) -> torch.Tensor:
@@ -790,7 +830,7 @@ class PoissonLinPSPSEPSSLinMult(nn.Module):
 
         #apply masks
         inhib_psps = torch.where(mask_psps.bool(), eta_psps, torch.ones_like(eta_psps))
-        inhib_epss = torch.where(mask_epss.bool(), eta_psps, torch.ones_like(eta_epss))
+        inhib_epss = torch.where(mask_epss.bool(), eta_epss, torch.ones_like(eta_epss))
         
         return inhib_psps * inhib_epss
 
@@ -1069,7 +1109,7 @@ class HawkesDiffusionLinbasePSPSEPSSLin(nn.Module):
         #penalize weights in epss/psps:
         return logsum - integral - psps_parmsum - epss_parmsum 
 
-class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
+class HawkesDiffusionLinbasePSPSEPSSLinMult(nn.Module):
     """
     Spatiotemporal Hawkes with diffusion-type kernel (Musmeci & Vere-Jones, 1992),
     + linear (log-link) baseline, + additive intensity inhibitions from PSPS/EPSS events
@@ -1089,12 +1129,11 @@ class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
     def __init__(self,
                  num_covariates: int,
                  cell_coords,
+                 inhib_feats = None,
                  bias: bool = True,
                  init_C: float = 8., #Scale excitation intensity; init big so that gradient descent doesn't ignore it
                  init_beta: float = 0.5, #time damping
                  init_sigma: float = 5., #kilometer scale
-                 init_psps: float=0.01, #initialize positive, the model internally negates it
-                 init_epss: float=0.01, #initialize positive, the model internally negates it
                  max_lag: int | None = None, #optional time cutoff (in time step units), could be useful for 6hr resolution?
                  coalesce_duplicates: bool = True #combine events in the same spacetime cell using weighting, making things faster
                  ):
@@ -1107,10 +1146,6 @@ class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
         self.raw_C = nn.Parameter(torch.tensor(float(init_C)))
         self.raw_beta = nn.Parameter(torch.tensor(float(init_beta)))
         self.raw_sigma = nn.Parameter(torch.tensor(float(init_sigma)))
-
-        #inhibitory effects
-        self.raw_psps = nn.Parameter(torch.tensor(float(init_psps)))
-        self.raw_epss = nn.Parameter(torch.tensor(float(init_epss)))
 
         #precompute squared deltas in x and y for all cell pairs
         coords = torch.as_tensor(cell_coords, dtype=torch.float32)  #(C,2)
@@ -1126,6 +1161,13 @@ class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
         self._eps = 1e-12
 
         self.coalesce_duplicates = coalesce_duplicates
+
+        if inhib_feats is not None:
+            self.inhib_feats = inhib_feats
+        else:
+            self.inhib_feats = list(range(0,num_covariates))
+        self.psps_linear = nn.Linear(len(self.inhib_feats), 1, bias=True)
+        self.epss_linear = nn.Linear(len(self.inhib_feats), 1, bias=True)
 
     #positive parameter views
     @property
@@ -1237,15 +1279,32 @@ class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
 
         return lam_exc
     
-    def _inhibition(self, inhib: torch.Tensor) -> torch.Tensor:
+    def _inhibition(self, inhib: torch.Tensor, cov: torch.Tensor) -> torch.Tensor:
         if inhib.dim() == 4 and inhib.shape[0] == 1:
             inhib = inhib.squeeze(0)
         if inhib.dim() != 3:
             raise ValueError(f"inhib must be 3D, got {inhib.dim()}D")
 
-        weights = torch.stack([self.psps, self.epss])
-        scaled = inhib.float().to(self.DX2.device) * weights.to(self.DX2.device) #multiply event indicators by the negative effect magnitude
-        return scaled.sum(dim=-1) #now collapse along the last axis with sum
+        if cov.dim() == 4 and cov.shape[0] == 1:
+            cov = cov.squeeze(0)
+        if cov.dim() != 3:
+            raise ValueError(f"cov must be (T,C,p), got {tuple(cov.shape)}")
+        
+        T, C, p = cov.shape
+        #forward through linears
+        cov_inhib = cov[..., self.inhib_feats]
+        eta_psps = torch.sigmoid(self.psps_linear(cov_inhib.view(-1, len(self.inhib_feats))).view(T, C))
+        eta_epss = torch.sigmoid(self.epss_linear(cov_inhib.view(-1, len(self.inhib_feats))).view(T, C))
+
+        #masks
+        mask_psps = inhib[..., 0]  #(T, C)
+        mask_epss = inhib[..., 1]  #(T, C)
+
+        #apply masks
+        inhib_psps = torch.where(mask_psps.bool(), eta_psps, torch.ones_like(eta_psps))
+        inhib_epss = torch.where(mask_epss.bool(), eta_epss, torch.ones_like(eta_epss))
+        
+        return inhib_psps * inhib_epss
 
     def forward(self,
                 cov: torch.Tensor, #(T,C,p)
@@ -1261,17 +1320,14 @@ class HawkesDiffusionLinbasePSPSEPSSFlat(nn.Module):
         T, C, _ = cov.shape
         lam_base = self._baseline(cov) #(T, C)
         lam_exc = self._excitation(T, events_tc) #(T, C)
-        lam_inhib = self._inhibition(inhib)
+        lam_inhib = self._inhibition(inhib, cov)
         if return_parts:
-            lam_total = lam_base + lam_exc + lam_inhib
+            lam_total = (lam_base + lam_exc) * lam_inhib
             #We need to recover exactly how much lam_inhib is reducing lam_total. We do not want extra magnitude that sends lam below 0.
-            negative_mask = (lam_total < 0).float()
-            lam_negative = torch.mul(lam_total, negative_mask) #only keep negative values
-            lam_inhib_fixed = lam_inhib + (-1 * lam_negative) #only retains the actual effects inhib had on lambda
-            return F.relu(lam_total), {"baseline": lam_base, "excitation": lam_exc, 'inhib': lam_inhib_fixed}
-        lam_total = F.relu(lam_base + lam_exc + lam_inhib)
-        return lam_total
-    
+            lam_decreased = lam_base * -(1 - lam_inhib)
+            return F.relu(lam_total), {"baseline": lam_base, "excitation": lam_exc, 'inhib': lam_decreased}
+        return (lam_base + lam_exc) * lam_inhib
+
     def loglik(self, cov: torch.Tensor, inhib: torch.Tensor, events: torch.Tensor):
         """
         cov: (T,C,p) tensor of covariates for any given year

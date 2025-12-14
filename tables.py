@@ -1,6 +1,6 @@
 import pandas as pd
 
-df = pd.read_csv("Results/results.csv")
+df = pd.read_csv("Results/results.csv").drop(columns = ["cv_model_save_path", "all_model_save_path"])
 df.style.set_table_styles(
     [{'selector': 'th', 'props': [('background-color', '#f7f7f7')]}]
 )
@@ -11,6 +11,16 @@ df.style.set_table_styles(
 )
 
 df = pd.DataFrame({'Model': ['Homogenous Poisson (Baseline)', 'Poisson GLM', 'Hawkes StdDiff w/ GLM Base'], 'Log Lik': [-8786.6729/2, -7954.551/2, -7922.531/2]})
+df.style.set_table_styles(
+    [{'selector': 'th', 'props': [('background-color', '#f7f7f7')]}]
+)
+
+df = pd.read_csv("Results/results_inhib_experiment.csv").drop(columns = ["cv_model_save_path", "all_model_save_path"])
+df.style.set_table_styles(
+    [{'selector': 'th', 'props': [('background-color', '#f7f7f7')]}]
+)
+
+df = pd.read_csv("Results/results_inhib_experiment_exclude20.csv").drop(columns = ["cv_model_save_path", "all_model_save_path"])
 df.style.set_table_styles(
     [{'selector': 'th', 'props': [('background-color', '#f7f7f7')]}]
 )

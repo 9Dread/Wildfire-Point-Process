@@ -76,7 +76,7 @@ def get_events(year):
     SDGE_data = read_event_file("SDGE", year)
     return(pd.concat([PGE_data, SCE_data, SDGE_data], ignore_index=True).dropna())
 
-def events_to_tensor(events_df, grid_gdf, time_res):
+def events_to_tensor(events_df, grid_gdf, time_res = "daily"):
     """
     events_df: Dataframe from get_events()
     grid_gdf: geodataframe of grid cells from get_point24deg_grid
@@ -106,11 +106,19 @@ def events_to_tensor(events_df, grid_gdf, time_res):
             events_joined = events_joined["T" >= 0]
         events_joined = events_joined.sort_values(by="T", ascending=True) #sort
     if time_res == "6hr":
-        pass #not implemented yet
+        #day of year, 0-indexed
+        doy = events_joined["T"].dt.dayofyear - 1
+        #hour within the day (0 to 23)
+        hours = events_joined["T"].dt.hour
+        #the 6-hour bin (0, 1, 2, 3)
+        six_hr_bin = hours // 6
+        #combine into a single "time step index"
+        events_joined["T"] = doy * 4 + six_hr_bin
+        events_joined = events_joined.sort_values(by="T", ascending=True) #sort
     spacetime = events_joined[["T", "cell_id"]]
     return torch.Tensor(spacetime.to_numpy())
 
-def get_events_tensor_list(time_res):
+def get_events_tensor_list(time_res = "daily"):
     """
     Returns list of tensors of fire events for each year. Each tensor has the time and space index of each event.
     time_res: 'daily' or '6hr'
@@ -132,7 +140,7 @@ def get_point24deg_grid():
     #note that the CA bounding box in epsg4326 is (-124.409591, 32.534156, -114.131211, 42.009518)
     xmin, xmax = -124.409591-pad, -114.131211+pad
     ymin, ymax = 32.534156-pad, 42.009518+pad
-    cells = [box(x, y, x+dx, y+dx)               # square cells
+    cells = [box(x, y, x+dx, y+dx) #square cells
             for x in np.arange(xmin, xmax, dx)
             for y in np.arange(ymin, ymax, dx)]
     grid_gdf = gpd.GeoDataFrame({"cell_id": range(len(cells))}, geometry=cells, crs=4326)
@@ -143,7 +151,7 @@ def get_point24deg_grid():
       .to_crs(4326) #ensure same CRS
       .dissolve()) #single polygon
     #keep only grid cells that intersect California
-    grid_gdf = grid_gdf.loc[grid_gdf.geometry.intersects(ca.geometry.iloc[0])].reset_index(drop=True)
+    grid_gdf = grid_gdf.loc[grid_gdf.geometry.within(ca.geometry.iloc[0])].reset_index(drop=True)
     grid_gdf["cell_id"] = grid_gdf.index
     if(drop_missing_cov_cells):
         grid_gdf = grid_gdf.drop(index = [71, 439, 461, 521]).reset_index(drop=True)
@@ -152,42 +160,52 @@ def get_point24deg_grid():
 
 #COVARIATES PROCESSING:
 
-def tensor_gridded_covs(year):
+def tensor_gridded_covs(year, time_res = "daily"):
     """
     Loads the tensor grid of the covariates for a given year. (T, C, p)
+    time_res: "daily" or "6hr"
     """
-    nc_dataset = xr.open_dataset(f"Data/CovsDaily/daily_gridded_CA_{year}.nc")
+    assert (time_res == "daily") | (time_res == "6hr"), "Invalid time_res. Use 'daily' or '6hr'"
+    if time_res == "daily":
+        nc_dataset = xr.open_dataset(f"Data/CovsDaily/daily_gridded_CA_{year}.nc")
+    else:
+        nc_dataset = xr.open_dataset(f"Data/Covs6hr/6hr_gridded_CA_{year}.nc")
     array = nc_dataset.to_array()
     array = array.transpose("time", "cell", "variable") #reorder stuff
     arr = array.values #shape (T, C, p)
     return(torch.from_numpy(arr).float(), list(nc_dataset.data_vars.keys()))
 
-def get_covs_tensor_list():
+def get_covs_tensor_list(time_res = "daily"):
     """
     Returns a list of tensors that contain the covariates from tensor_gridded_covs()
+    time_res: "daily" or "6hr"
     """
-
+    assert (time_res == "daily") | (time_res == "6hr"), "Invalid time_res. Use 'daily' or '6hr'"
     years = [2020, 2021, 2022, 2023, 2024]
     tensor_list = []
     for year in years:
-        tensor, names_list = tensor_gridded_covs(year)
+        tensor, names_list = tensor_gridded_covs(year, time_res)
         tensor_list.append(tensor)
-        #return list of tensors, variable names
+    #return list of tensors, variable names
     return tensor_list, names_list 
     
     
-def standardize_cov_tensors(list):
+def standardize_cov_tensors(list, valid = False):
     """
     Given the list of the covariate tensors, return a list of standardized tensors
     list: list of tensors (1 tensor per year)
+    valid: if true, does not use last item's data in standardization; assumes it is validation set.
     """
     p = list[0].shape[2] #number of covariates
     #quick standardization
-    all_data = torch.cat([c.view(-1, p) for c in list], dim=0)
+    if valid:
+        all_data = torch.cat([list[i].view(-1, p) for i in range(0, len(list)-1)], dim=0)
+    else:
+        all_data = torch.cat([c.view(-1, p) for c in list], dim=0)
     means = all_data.mean(dim=0) #shape (p,)
-    stds  = all_data.std(dim=0) #shape (p,)
+    stds = all_data.std(dim=0) #shape (p,)
     standardized = [(cov - means) / stds for cov in list]
-    return(standardized)
+    return standardized, means, stds
 
 class WildfireDataset(Dataset):
     """
@@ -316,110 +334,222 @@ def get_epss_events_list():
         out_list.append(epss_joined.loc[:,['Start', 'End', 'geometry']])
     return out_list
 
-def inhib_to_tensor(psps_gdf, epss_gdf, grid_gdf):
+def inhib_to_tensor(psps_gdf, epss_gdf, grid_gdf, time_res = "daily"):
     """
     given psps and epss gdfs, each of which have Start, End, geometry columns describing the spacetime
     occurence of inhibitory events, return a (T,C,2) indicator tensor of whether cells in grid_gdf
     currently intersect an active area.
     """
+    assert (time_res == "daily") | (time_res == "6hr"), "Invalid time_res. Use 'daily' or '6hr'"
     year = psps_gdf.loc[0,'Start'].year
-    days = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
-    T = len(days)
+
+    if time_res == "daily":
+        times = pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+    elif time_res == "6hr":
+        times = pd.date_range(f"{year}-01-01", f"{year}-12-31 23:59:59", freq="6h")
+    T = len(times)
     C = len(grid_gdf)
 
     #helper, only used here so i'm just gonna define it here
-    def daily_hits(gdf, grid_gdf):
+    def hits(gdf, grid_gdf):
         arr = np.zeros((T, C), dtype=np.float32)
-        for d_idx, d in enumerate(days):
-            #select polygons active on this day
-            active = gdf[(gdf["Start"] <= d) & (gdf["End"] >= d)]
+        for t_idx, t in enumerate(times):
+            #select polygons active at this instant
+            active = gdf[(gdf["Start"] <= t) & (gdf["End"] >= t)]
             if active.empty:
                 continue
-            #spatial join: which cells are touched by those polygons
+            #spatial join: which cells are touched by
+            #those polygons
             joined = gpd.sjoin(
                 grid_gdf[["cell_id", "geometry"]],
                 active.set_geometry("geometry"),
                 how="inner",
                 predicate="intersects"
             )
-            arr[d_idx, joined["cell_id"].to_numpy()] = 1.0
+            arr[t_idx, joined["cell_id"].to_numpy()] = 1.0
         return arr
     
-    psps_arr = daily_hits(psps_gdf, grid_gdf)
-    epss_arr = daily_hits(epss_gdf, grid_gdf)
+    psps_arr = hits(psps_gdf, grid_gdf)
+    epss_arr = hits(epss_gdf, grid_gdf)
     return torch.tensor(np.stack([psps_arr, epss_arr], axis=-1))
 
 def get_inhib_tensor_list(time_res='daily'):
     """
-    time_res: time resolution to get events at. currently only 'daily' is supported.
+    time_res: time resolution to get events at.
     
     Reads psps/epss events data and returns list of 5 tensors (T,C,2), one for each year. Note
     that there are no events for 2020, so this year will just have a zeros tensor.
     """
+    assert (time_res == "daily") | (time_res == "6hr"), "Invalid time_res. Use 'daily' or '6hr'"
     #grid to aggregate to
     grid_gdf = get_point24deg_grid()
 
-    #just treat time_res like daily for now, update later if needed
     psps_list = get_psps_events_list()
     epss_list = get_epss_events_list()
-
-    out_list = [torch.zeros(size=(365,len(grid_gdf),2),dtype=torch.float)] #2020 grid of zeros (365 days since we dropped jan 1 from daily covs)
+    #2020 will just be a zeros tensor. Time size depends on daily or 6hr.
+    if time_res == "daily":
+        out_list = [torch.zeros(size=(365,len(grid_gdf),2),dtype=torch.float)] #2020 grid of zeros (365 days since we dropped jan 1 from daily covs)
+    else:
+        out_list = [torch.zeros(size=(1464,len(grid_gdf),2),dtype=torch.float)]
     for i in range(0, len(psps_list)):
-        out_list.append(inhib_to_tensor(psps_list[i], epss_list[i], grid_gdf)) #append T,C,2 tensor for each year
+        out_list.append(inhib_to_tensor(psps_list[i], epss_list[i], grid_gdf, time_res)) #append T,C,2 tensor for each year
     return out_list
 
+#NEW DATASET VERSION (overlapping subsets)
+class WildfireIndexDataset(Dataset):
 
+    def __init__(self, sub_size: int, deltax: int, years: list, device, inhib: bool, time_res, means = None, stds = None):
+        """
+        sub_size: the size of each sub-sequence
+        deltax: how many time steps to jump before starting the next sub-sequence (allows
+            overlap with the previous sequence if deltax < sub_size)
+        years: list of years 2020-2024 to make subsequences out of. The years should be
+            ordered and contiguous (e.g. [2020,2022] is not allowed). 
+        device: a PyTorch device
+        inhib: a boolean flag; if true, includes inhib data (psps/epss) in the dataset.
+        time_res: either "6hr" or "daily"
+        means: Means of each variable. If None, estimates them from the data. Useful
+            if we have a testing set and we need to adjust covariates using the same
+            standardization from the training set. 
+        stds: Standard deviations of each variable. Similar logic to means.
+        """
+        #Creates an index dataset to efficiently 
+        #split training data into smaller, potentially-overlapping subsets
+        #for training.
+        #sub_size is the size of each subset, and
+        #deltax is the difference between each starting index
+        #of each subset. If sub_size=deltax then we get standard,
+        #non-overlapping subsets of size sub_size.
+        #To prevent any loss of data the last subset is guaranteed to include
+        #the last sub_size time steps of the training sequence.
+        assert(sub_size >= 1), "sub_size must be positive"
+        assert(deltax >= 1), "deltax must be positive"
+        assert((time_res == "daily") | (time_res == "6hr")), "Use time_res = 'daily' or time_res = '6hr'"
+        assert((means is None) and (stds is None)) or ((means is not None) and (stds is not None)), "Means and stds, if provided, must both be provided at once"
 
-#HELPERS FOR preproc.py 
-def aggregate_tif_to_cells(tif_path, grid_gdf_aligned, stats="mean", nodata=None, all_touched=False):
-    """
-    Returns a 1D numpy array of length n_cells with the aggregated value per cell polygon.
-    grid_gdf_aligned must be in the same order as the desired cell order. Used to aggregate
-    fm100 and fm1000 from 12/31/2019 to the desired grid cells.
-    """
-    #compute means in each grid cell
-    zs = zonal_stats(
-        vectors=grid_gdf_aligned.geometry,
-        raster=str(tif_path),
-        stats=stats,
-        nodata=nodata,
-        all_touched=all_touched,
-        geojson_out=False
-    )
-    vals = np.array([d[stats] if d[stats] is not None else np.nan for d in zs], dtype=float)
-    return vals
+        #Requires that the sequence be contiguous and in order.
+        for i in range(len(years)-1):
+            assert(years[i] == years[i+1]-1), "Make sure the years are ordered and contiguous."
+        covars, varnames = get_covs_tensor_list(time_res)
+        self.varnames = varnames
 
-def ensure_grid_order_matches(ds, grid_gdf, id_col="cell_id"):
-    """
-    Align grid_gdf rows to match ds.cell (xarray ds) coordinate order via 'id' matching.
-    Returns aligned GeoDataFrame and an indexer to reindex any arrays defined on grid_gdf rows.
-    Requires ds to have a 'cell' coordinate (which are ids).
-    """
-    cell_coord = ds["cell"].values
-    #if cell is numeric 0..N-1 and grid_gdf[id_col] matches that sequence, good.
-    #otherwise, treat cell_coord as the ids to align to.
-    #build a mapping from id to row index in grid_gdf
-    id_to_idx = {rid: i for i, rid in enumerate(grid_gdf[id_col].values)}
-    try:
-        idxs = np.array([id_to_idx[rid] for rid in cell_coord], dtype=int)
-    except KeyError as e:
-        raise ValueError(f"Found cell id {e} in ds that does not exist in grid_gdf[{id_col}].")
-    return grid_gdf.iloc[idxs].reset_index(drop=True), idxs
+        #handle standardization
+        if((means is None) and (stds is None)):
+            covars, means_est, stds_est = standardize_cov_tensors(covars, False)
+            self.means = means_est
+            self.stds = stds_est
+        else:
+            self.means = means
+            self.stds = stds
+            covars = [(cov - means) / stds for cov in covars]
 
-def shift_forward_one_year(old_vals, first_day_value):
-    """
-    old_vals: (time, cell) array for a single year (DataArray values)
-    first_day_value: (cell,) array to insert at index 0
-    returns new_vals with same shape as old_vals, applying forward shift:
-        new[0] = first_day_value
-        new[1:] = old[:-1]
-    """
-    if first_day_value.shape[0] != old_vals.shape[1]:
-        raise ValueError("first_day_value length does not match number of cells.")
-    new_vals = np.empty_like(old_vals)
-    new_vals[0, :] = first_day_value
-    new_vals[1:, :] = old_vals[:-1, :]
-    return new_vals
+        events = get_events_tensor_list(time_res)
+
+        if inhib:
+            inhib = get_inhib_tensor_list(time_res)
+        
+        self.covars = []
+        self.events = []
+        if inhib:
+            self.inhib = []
+        else:
+            self.inhib = None
+
+        for year in years:
+            if year == 2020:
+                self.covars.append(covars[0])
+                self.events.append(events[0])
+                if inhib:
+                    self.inhib.append(inhib[0])
+            elif year == 2021:
+                self.covars.append(covars[1])
+                self.events.append(events[1])
+                if inhib:
+                    self.inhib.append(inhib[1])
+            elif year == 2022:
+                self.covars.append(covars[2])
+                self.events.append(events[2])
+                if inhib:
+                    self.inhib.append(inhib[2])
+            elif year == 2023:
+                self.covars.append(covars[3])
+                self.events.append(events[3])
+                if inhib:
+                    self.inhib.append(inhib[3])
+            elif year == 2024:
+                self.covars.append(covars[4])
+                self.events.append(events[4])
+                if inhib:
+                    self.inhib.append(inhib[4])
+        
+        #adjust event time indices
+        adjustment = 0
+        for i in range(len(self.covars)):
+            #adjust event indices forward by the
+            #number of time steps in previous years
+            self.events[i][:,0] += adjustment
+            adjustment += self.covars[i].size()[0]
+
+        self.covars = torch.cat(self.covars, dim=0).to(device)
+        self.events = torch.cat(self.events, dim=0).to(device)
+        if inhib:
+            self.inhib = torch.cat(self.inhib, dim=0).to(device)
+        #print(self.covars.size()[0], " ", self.inhib.size()[0], " ", self.events.size()[0])
+        if inhib:
+            assert(self.covars.size()[0] == self.inhib.size()[0]), "Uneven time axes between covars, inhib"
+
+        self.seq_size = self.covars.size()[0]
+        #print(self.seq_size)
+        assert (self.seq_size >= sub_size), "Make sure the subset size is not greater than the sequence size"
+        
+        #make a list of the starting indices. 
+        self.sub_size = sub_size
+        self.list = []
+        index = 0
+        while(index+sub_size <= self.seq_size):
+            self.list.append(index)
+            index = index + deltax
+        if(index - deltax != self.seq_size - sub_size): 
+            self.list.append(self.seq_size - sub_size)
+
+    def __len__(self):
+        return len(self.list)
+    
+    def __getitem__(self, idx):
+        return self.get_subset(self.list[idx])
+
+    def get_subset(self, i):
+        #get the subset starting at index i
+        assert (0 <= i) and (i + self.sub_size - 1 < self.seq_size), "Index out of bounds"
+        if self.inhib is not None:
+            events = self.events.clone()
+            #Must adjust the indices of the events like:
+            events[:,0] -= i
+            #Event mask (only get events in time range)
+            mask = (self.events[:, 0] >= i) & (self.events[:, 0] < i + self.sub_size)
+            events = events[mask].to(dtype=torch.int)
+            return self.covars[i:i+self.sub_size,...], self.inhib[i:i+self.sub_size,...], events
+        else:
+            events = self.events.clone()
+            #Must adjust the indices of the events like:
+            events[:,0] -= i
+            #Event mask (only get events in time range)
+            mask = (self.events[:, 0] >= i) & (self.events[:, 0] < i + self.sub_size)
+            events = events[mask].to(dtype=torch.int)
+            return self.covars[i:i+self.sub_size,...], events
+    
+    #for debugging
+    def get_index_list(self):
+        return self.list
+
+    #To get varnames (and take len of this list to be number of vars)
+    def get_varnames(self):
+        return self.varnames
+    
+    #To get means/stds to apply to a validation set
+    def get_transformation(self):
+        return self.means, self.stds
+
 
 def grid_to_cell_coords(grid_gdf, metric_crs=False):
     """
